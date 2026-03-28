@@ -14,6 +14,14 @@ Automated Research Engine for Specification.
 ```bash
 python -m core.orchestrator --stage generate
 python -m core.orchestrator --stage manual-pause
+
+python -m core.manual_import --source manual_claude --file data/manual_inputs/claude_grounded.txt
+python -m core.manual_import --source manual_gemini --file data/manual_inputs/gemini_grounded.txt
+python -m core.manual_import --source manual_gpt4 --file data/manual_inputs/gpt4_grounded.txt
+python -m core.manual_import --source manual_claude --file data/manual_inputs/claude_free.txt
+python -m core.manual_import --source manual_gemini --file data/manual_inputs/gemini_free.txt
+python -m core.manual_import --source manual_gpt4 --file data/manual_inputs/gpt4_free.txt
+
 python -m core.orchestrator --stage consolidate
 python -m core.orchestrator --stage enumerate
 python -m core.orchestrator --stage rank
