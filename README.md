@@ -12,6 +12,7 @@ Automated Research Engine for Specification.
 4. Run:
 
 ```bash
+python -m core.orchestrator --stage manual-papers
 python -m core.orchestrator --stage generate
 python -m core.orchestrator --stage manual-pause
 
