@@ -1,0 +1,26 @@
+ROLE: You are a precise scientific knowledge extractor.
+
+TASK: Read the following paper and extract a structured record.
+
+Return a JSON object matching this exact schema:
+{
+  "title": "",
+  "problem": "",
+  "method": "",
+  "inputs": "",
+  "outputs": "",
+  "training_data": "",
+  "inference_cost": "low | medium | high | unknown",
+  "core_idea": "",
+  "relevance_to_project": "",
+  "possible_transfer": "",
+  "failure_modes": "",
+  "citations": []
+}
+
+Rules:
+- Be specific.
+- "possible_transfer" must be concrete.
+- "failure_modes" should include obvious weaknesses when relevant.
+- If unsure about inference_cost, use "unknown".
+- Return only JSON.

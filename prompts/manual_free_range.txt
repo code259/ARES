@@ -1,0 +1,19 @@
+You are a senior ML research scientist.
+
+BOTTLENECK:
+My current potency prediction model requires molecular docking at inference time.
+Docking is compute-intensive and does not scale beyond about 200k molecules.
+The environment is low-data.
+I need to either eliminate docking from inference or dramatically reduce its cost
+while preserving predictive performance.
+
+Do not focus on papers I might already know. Reason from first principles and
+adjacent ML domains that are underrepresented in drug discovery literature.
+
+Generate 5–7 research hypotheses. For each include:
+- Name
+- Core idea
+- Why it applies to a low-data molecular ML problem
+- What makes it non-obvious or underexplored
+- Biggest risk
+- What a 2-week prototype would look like

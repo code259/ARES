@@ -1,0 +1,18 @@
+You are a senior ML research scientist advising on a drug discovery pipeline bottleneck.
+
+CONTEXT BRIEF:
+[PASTE COMPACT RESEARCH BRIEF HERE — include brief version number]
+
+Your task:
+1. Generate 5–8 novel research hypotheses to solve this bottleneck.
+2. Draw primarily from the method families and papers described in the brief.
+3. Combine or extend ideas in ways that are not already listed as existing hypotheses.
+4. For each hypothesis, provide:
+   - Name
+   - Core idea
+   - Why it should work in a low-data regime
+   - Estimated speedup vs docking
+   - Biggest risk
+   - Minimal experiment to validate
+
+Format: numbered list, one hypothesis per item. Be specific and technical.

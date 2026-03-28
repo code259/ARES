@@ -1,0 +1,21 @@
+ROLE: You are a research synthesis specialist.
+
+TASK:
+1. Cluster semantically similar ideas by method family.
+2. Flag duplicates where the same core idea appears with different wording.
+3. Flag consensus ideas when they appear in 2 or more independent source types.
+
+Return only JSON in the form:
+{
+  "clusters": [
+    {
+      "cluster_id": "",
+      "method_family": "",
+      "representative_hypothesis_id": "",
+      "member_ids": [],
+      "sources_represented": [],
+      "consensus_flag": true,
+      "consensus_rationale": ""
+    }
+  ]
+}

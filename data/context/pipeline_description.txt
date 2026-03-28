@@ -1,0 +1,331 @@
+# RecA Comprehensive Project Guide & Systems Specification
+==========================================================================================
+
+## Table of Contents
+1. [Executive Summary](#1-executive-summary)
+2. [System Overview: RecA Modulator Discovery Pipeline](#2-system-overview-reca-modulator-discovery-pipeline)
+3. [Data Sourcing and Modalities](#3-data-sourcing-and-modalities)
+4. [Model Architecture: Evolution and Final Design](#4-model-architecture-evolution-and-final-design)
+5. [Docking Infrastructure: `reca-container` Deep Dive](#5-docking-infrastructure-reca-container-deep-dive)
+6. [Training Constraints and Evaluation](#6-training-constraints-and-evaluation)
+7. [Future Research Directions](#7-future-research-directions)
+8. [Appendices](#8-appendices)
+
+---
+
+## 1. Executive Summary
+
+This document serves as the master blueprint and hyper-detailed project specification for the RecA structural optimization and discovery project. As a reference for research agents and human engineers, this guide meticulously details every iteration of the RecA regressor, the underlying hybrid AI-physics model architecture, the massive-scale docking inference infrastructure, and the specific data representations and constraints utilized in the final deployment.
+
+Currently, the primary bottleneck in the RecA inference pipeline is the computational cost of molecular docking. While the existing infrastructure gracefully handles libraries up to 200,000 compounds using Google Cloud Batch, scaling beyond millions or billions of compounds demands an architectural shift to reduce or completely eliminate the docking dependency. By understanding the intricate role that physics-based features play in the current best-performing model—particularly their critical contribution to out-of-distribution (OOD) extrapolation—future iterations of the system can be designed to approximate these signals via faster surrogates or zero-docking contrastive approaches.
+
+
+## 2. System Overview: RecA Modulator Discovery Pipeline
+
+The RecA discovery pipeline is a multi-stage machine learning system designed to identify novel, potent inhibitors of the RecA protein, a critical bottleneck in bacterial SOS response networks. Traditional virtual screening relies solely on physics-based docking, which exhibits severe structural bias and high false-positive rates due to computational approximations in scoring functions. Conversely, pure ligand-based machine learning approaches (like QSAR Random Forests) memorize chemical space and fail catastrophically when forced to extrapolate to entirely novel scaffolds.
+
+To bridge this gap, the RecA pipeline utilizes a **Two-Stage Hybrid Architecture**:
+1. **Screening Classifier**: An XGBoost model that rapidly filters out non-binders with high recall (0.99 for ATP-competitive inhibitors).
+2. **Potency Regressor (Delta Model)**: A hybrid RANSAC + Gaussian Process model that predicts the affinity (pIC50) of the filtered actives, leveraging a physical baseline corrected by a chemical residual.
+
+### 2.1 Component Interplay
+Molecules enter as SMILES strings. They undergo 3D conformation generation via RDKit (ETKDGv3), format conversion (PDBQT), and are docked against 6 rigid RecA protein conformations simultaneously. The extracted docking metrics and spatial contact features form the "physics" representation. Concurrently, 2D topological descriptors and ECFP4 fingerprints form the "chemical" representation. Both representations are fused into the Regressor Delta model to predict potency.
+
+
+## 3. Data Sourcing and Modalities
+
+### 3.1 Raw Data Sources and Availability
+The project is built upon highly constrained, sparse biological data. Specifically:
+- **Actives (N=51 initially, refined to N=49):** Sourced from biochemical assays. The primary label for regression is **pIC50**, transforming raw half-maximal inhibitory concentrations into a logarithmic scale (`pIC50 = -log10(IC50 * 1e-6)` where IC50 is in µM).
+- **Patent Data / Negatives:** Used to train the initial binary classifier but explicitly excluded from the regressor to avoid heavily imbalancing the continuous potency distribution with zeroes.
+- **Physics Set (N=62):** A broader set `reca_all.csv` was historically tested for physics extraction, but the final model restricts physics learning strictly to the N=49 actives (`reca_active.csv`) because the broader set exhibited poor correlation (0.23) with binding energy, while the strict active set had a robust predictive correlation (0.55).
+
+### 3.2 Input Modalities
+For every molecule, the system synthesizes three distinct feature modalities:
+
+#### 3.2.1 2D Chemical Descriptors (12 Features)
+Extracted directly from the SMILES sequence using RDKit, these represent the fundamental physicochemical properties of the molecule:
+1. `MolWt`: Molecular Weight
+2. `LogP`: Calculated octanol-water partition coefficient
+3. `TPSA`: Topological Polar Surface Area
+4. `HBD`: Number of Hydrogen Bond Donors
+5. `HBA`: Number of Hydrogen Bond Acceptors
+6. `RotatableBonds`: Number of flexible bonds
+7. `RingCount`: Total number of rings
+8. `AromaticRings`: Number of aromatic rings
+9. `FractionCSP3`: Sp3 hybridized carbon fraction
+10. `HeavyAtomCount`: Total non-hydrogen atoms
+11. `FormalCharge`: Net charge of the molecule
+12. `Heteroatoms`: Non-carbon heavy atoms
+
+#### 3.2.2 Fingerprints (2048-bit ECFP4)
+Extended Connectivity Fingerprints (Radius 2, 2048 bits). These capture the exact topological subgraphs within the molecule, enabling the regressor to match functional groups (e.g., matching a sulfonic acid moiety against previously seen sulfonates).
+
+#### 3.2.3 Docking & Structural Features (3D Modality)
+Extracted post-docking, these features represent the spatial behavior of the molecule inside the RecA binding pockets:
+- `score_mean`: The average smina docking affinity computed across all 6 targeted protein conformations.
+- `Dist_to_Walker_A`: The euclidean distance (in Angstroms) from the ligand's center of mass to the center of the Walker A motif (residues 66-72).
+- `HBond_Counts`: A heuristic count of N/O atom pairs within 3.5 Å of corresponding receptor polar atoms.
+
+
+## 4. Model Architecture: Evolution and Final Design
+
+The model underwent 8 distinct architectural iterations, shifting from purely data-driven to a highly sophisticated physics-guided paradigm. This evolution was driven by the core requirement: **Extrapolative capability on novel scaffolds (Tanimoto similarity < 0.4).**
+
+### 4.1 Historical Iterations
+
+#### Iteration 1: Random Forest Base Model
+- **Approach:** Initial Delta Learning attempt using a Random Forest to predict a baseline, plus a residual model.
+- **Result:** Failed. Global RMSE and Extrapolation RMSE both hovered at ~0.70.
+- **Failure Mode:** Ensembles of decision trees cannot extrapolate beyond their training domain boundaries. For completely novel scaffolds, the RF reverted to predicting the chemical mean, completely shattering predictive power.
+
+#### Iteration 2: Single-Pocket (1REA) RANSAC
+- **Approach:** Introduced a linear RANSAC (RANdom SAmple Consensus) regressor trained strictly on `best_docking_score` from a single ATP-binding conformation, `1REA_ADP_pocketB`.
+- **Result:** Improved Global RMSE (0.34) but Extrapolation remained poor (0.78).
+- **Failure Mode:** Models relying entirely on a single structural snapshot suffered heavily from standard docking noise. It entirely missed uniquely binding compounds like Suramin and Congo-red, categorizing them as non-binders due to geometric clashes with the rigid 1REA pocket.
+
+#### Iteration 3 & 4: Multi-Conformation Mean (`score_mean`)
+- **Approach:** Shifted from tracking the absolute best score from one pocket to tracking the `score_mean`—the arithmetic average docking score across all 6 targeted conformations.
+- **Discovery:** `score_mean` exhibited a 3.7x stronger Pearson correlation with pIC50 than the raw `best_docking_score` (-0.324 vs -0.005).
+- **Reasoning:** In computational docking against rigid receptors, single scores are incredibly noisy. A ligand might artificially score beautifully if it randomly fits a pocket, or crash terribly if a single sidechain obstructs it. Averaging scores across multiple conformations (ATP bound, DNA groove, L2 loop conformations) acts as an ensemble filter—true binders consistently exhibit reasonable affinities across minor pocket fluctuations.
+- **Result:** Suramin prediction error dropped beautifully from 1.41 to 0.44. Extrapolation RMSE plummeted to 0.31.
+
+#### Iteration 5: Hybrid Cross-Validation Protocol
+- **Challenge:** Leave-One-Scaffold-Out Cross-Validation (LOSO-CV) on N=49 samples critically destabilized the weak linear physics signal. When leaving out a major scaffold, the RANSAC baseline line of best fit would drastically tilt, ruining the residual calculation.
+- **Solution:** A **Split Training Strategy**. The linear RANSAC base model is trained *exactly once* on the entire N=49 active set statically. This explicitly models the global "physics trend". The subsequent Gaussian Process Delta model is evaluated strictly under LOSO-CV, ensuring chemical interpolation is rigorously tested for generalizability while maintaining a stable physical compass.
+
+#### Iteration 6 & 7: Biological Feature Integration
+- **Approach:** Massive outliers like Congo-red completely failed standard docking (positive, repulsive scores) because they are too massive or rigid to wedge into slightly closed pockets.
+- **Biological Integration:** The physical baseline was expanded from single variable `score_mean` to include `Dist_to_Walker_A` and `HBond_Counts`.
+- **The Imputation Trick:** When smina fails to dock a massive molecule like Congo-red, the distance metrics technically become NaN. The system imputes `Dist_to_Walker_A = 0.0` for entirely failed docking runs. Crucially, the model had learned that a smaller distance implies higher potency (negative coefficient). Therefore, imputing 0.0 artificially 'rescued' the prediction for large, complex biologic-like molecules that failed computationally but were biologically active.
+- **Result:** Congo-red error dropped to incredibly precise margins (0.42). Global Extrapolation RMSE established a new state-of-the-art at 0.25.
+
+#### Iteration 8 (Final): The Split-Slope Architecture
+- **The Paradox:** The linear regressor previously established a positive slope (+0.06), which created the "Perfect Docking Paradox". A molecule with a theoretical god-tier docking score of -15.0 kcal/mol was mathematically penalized because the slope was positive.
+- **Solution:** Decoupling the `score_mean` signal via a logical break:
+  1. `score_mean_clean`: (`min(score, 0.0)`). Coeff is -0.09. Accurately asserts: lower negative scores = higher predicted pIC50.
+  2. `Is_Failed_Docking`: Binary flag (1.0 if score >= 0 or NaN). Coeff +1.42. Acts as a potent offset specific for biologic-scale molecules (Suramin-effect).
+- **Result:** Paradox solved. Expected bounds hold true on inference. Final Extrapolation RMSE of 0.23.
+
+
+### 4.2 Final Architecture Specification
+
+The exact architecture is defined in `unified_model.py` and `regclass_delta_model.py`.
+
+```python
+# BASE MODEL: RANSAC Linear Regression (Physics & Contacts)
+RANSACRegressor(
+    estimator=LinearRegression(),
+    min_samples=0.8,
+    residual_threshold=1.0,
+    random_state=42
+)
+# Training input: [score_mean_clean, Is_Failed_Docking, Dist_to_Walker_A, HBond_Counts]
+
+# DELTA MODEL: Gaussian Process Regressor (Chemical Descriptors)
+k_ecfp = ColumnSelectorKernel(TanimotoKernel(), 0, 2048)
+k_desc_2d = ColumnSelectorKernel(ConstantKernel(1.0) * RBF(1.0), 2048, 2060)
+k_struct = ColumnSelectorKernel(ConstantKernel(1.0) * RBF(1.0), 2060, max)
+kernel = k_ecfp + k_desc_2d + k_struct + WhiteKernel(noise_level=0.04)
+GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=1)
+```
+
+#### 4.2.1 Target and Loss
+Prediction target is continuous **pIC50**. Evaluation loss during training is Root Mean Squared Error (RMSE), rigorously bisected into Global RMSE and Extrapolation RMSE (Tanimoto structural similarity < 0.4 relative to training data).
+
+
+## 5. Docking Infrastructure: `reca-container` Deep Dive
+
+To execute docking across massive datasets, we built `reca-container`, a horizontally scaling cloud batch application. Below is the hyper-detailed specification of how the system functions, which is crucial for identifying bottlenecks to bypass docking in the future.
+
+### 5.1 Container Orchestration (`run_task.sh`)
+The entry point for the Google Cloud Batch execution is `run_task.sh`. The cloud provides `BATCH_TASK_INDEX`, a single monotonically increasing integer for every spawned container. 
+The script translates this index into a specific data shard and protein conformation:
+```bash
+SHARD_ID=$(( BATCH_TASK_INDEX / N_CONF ))
+CONF_ID=$(( BATCH_TASK_INDEX % N_CONF ))
+```
+This architecture guarantees that if there are 6 protein conformations, jobs 0-5 process Shard 0 against all 6 conformations in parallel, jobs 6-11 process Shard 1, etc. 
+
+**Pipeline Flow:**
+1. Downloads compressed ligand shards (`shard.tar.gz`) from Google Cloud Storage.
+2. Downloads the specific receptor `receptor.pdbqt` and `config.txt`.
+3. Invokes `dock.py` for massive parallel execution inside the container.
+4. Selectively runs `extract_features.py` using BioPython for the top outputs.
+5. Syncs results and `DONE.json` markers back to GCS. Idempotency is strict: if `DONE.json` exists in GCS, the container terminates cleanly without re-executing.
+
+
+### 5.2 Ligand Prep (`prep_ligand.py`)
+SMILES must be converted to 3D physical coordinates before docking. This is an expensive offline/pre-processing step.
+- **Normalization:** Sanitizes patent SMILES syntax (e.g., swapping `[Me]` for `C`).
+- **3D Embedding:** Utilizes RDKit's ETKDGv3 (Experimental-Torsion Knowledge Distance Geometry) algorithm with up to 3 fallback random seeds.
+- **Optimization:** Uses UFF (Universal Force Field) or MMFF94 to relax the molecule, alleviating unrealistic geometric strains.
+- **Conversion:** Bridges to OpenBabel `pybel` to convert the spatial coordinates into `.pdbqt` format (assigning AutoDock atom types and partial charges).
+
+
+### 5.3 Docking Engine (`dock.py`)
+The engine runs `smina`, a fork of AutoDock Vina tailored for custom scoring functions and batch execution. 
+- **Multiprocessing:** Internally bypasses python's GIL by leveraging `multiprocessing.Pool` across standard container vCPUs, opening one subprocess per ligand.
+- **CLI Invocation:**
+  ```bash
+  smina --config config.txt --receptor receptor.pdbqt \
+        --ligand ligand.pdbqt --out {ligand_id}_out.sdf \
+        --log smina.log --cpu 1 --quiet
+  ```
+- **Metrics parsing:** It uses regex against `smina.log` to harvest the first mode affinity. Standard Vina log formats output `affinity` as the first float on line 1.
+
+### 5.4 Feature Extraction (`extract_features.py`)
+This is perhaps the most mathematically dense component. It maps the spatial docking `.sdf` outputs back against the original `.pdb` structure using BioPython's `NeighborSearch`.
+
+**Configurations & Key Residues mapping:**
+Depending on the protein (1REA, 7JY7, 8AMD), exact spatial coordinates of crucial active sites are hardcoded. For example, in 1REA, the `Walker_A` motif encompasses residues 66-72. The `Catalytic` site is Glu96.
+
+**Extraction logic:**
+1. Extracts Center of Mass (COM), Radius of Gyration, and Principal Moments of Inertia (PMI 1/2/3) using RDKit's 3D descriptors on the docked coordinates.
+2. Parses the receptor `.pdb` via BioPython and extracts spatial centers (CA/CB vectors).
+3. Generates a KD-Tree wrapper (`NeighborSearch`) around all receptor atoms.
+4. Computes interactions for all ligand atoms against protein atoms within 4.5 Å.
+   - `Hydrophobic_Contacts`: Validated if both ligand and protein atoms are Carbon and distance < 4.0 Å.
+   - `HBond_Counts`: Validated if both are N or O and distance < 3.5 Å.
+   - `Salt_Bridge_Counts`: Validated if ligand holds formal charge, receptor is ASP/GLU/LYS/ARG/HIS, and distance < 4.0 Å.
+5. Calculates exact Euclidean distance from the ligand's center of mass to specific subunit motif centers (e.g., `Dist_to_Walker_A`).
+
+These precisely engineered values are the backbone of the final iterations of the regressor model. 
+
+## 6. Training Constraints and Evaluation
+
+### 6.1 Constraints on Retraining and Inference
+1. **Data Leakage in Physics Baselines:** The `reca_active.csv` dataset is critically small (N=49). If one were to cross-validate the RANSAC baseline line of best fit alongside the GP, holding out 10% of the dataset would drastically shift the baseline slope. The constraint explicitly states that the RANSAC model must be trained *statically* over the entirety of the physics set, outputting rigid bias, while only the GP Regressor executes Leave-One-Scaffold-Out Cross-Validation (LOSO-CV).
+2. **Docking Bottleneck Limits:** Because each ligand relies on 6 parallel docking simulations to produce `score_mean` and `Dist_to_Walker_A`, running inference on batches >200k compounds invokes hundreds of dollars in cloud execution time. Future regressions MUST seek to estimate proxy `Dist_to_Walker_A` directly from 2D structures to circumvent Smina, or filter via XGBoost before submitting to Smina.
+3. **Prediction Clamping:** During inference, final outputs of the Delta Model are artificially clamped between `[2.0, 9.0]` to guarantee biologically realizable pIC50 limits, averting wild Gaussian Process variances in uncharted latent space.
+
+
+### 6.2 Data Size and Scaffold Splits
+Performance MUST only be judged by Tanimoto Scaffold Split performance. Because N=49 is minuscule, taking a random 80/20 train/test split will invariably leak incredibly similar sibling molecules into the test set, creating heavily optimistic RMSEs. All code enforces `GroupKFold` using Murcko Scaffolds to guarantee the model is interpolating chemistry, not memorizing the assay sheet.
+
+## 7. Future Research Directions: Eliminating Docking
+
+The mandate to scale inference dictates scaling past computational docking. To achieve this, the overarching architecture detailed in this guide provides specific paths forward:
+
+1. **Graph Neural Networks (GNNs) for 3D Proxy:** A GNN could be trained over the ~200k already-docked molecules in the project history, using the SMILES graph to output a direct prediction of `score_mean` and `Dist_to_Walker_A`. The Regressor Delta model wouldn't know the difference—it would just consume the proxy features instantly rather than waiting for an hour of Smina.
+2. **Contrastive Language-Image Pretraining (CLIP) for Molecules:** A twin-tower architecture where Tower A encodes protein binding pockets and Tower B encodes 2D ECFP structures, learning an embedding space where binding translates to cosine similarity. This zero-shot capability completely negates the explicit extraction of 3D features.
+
+
+## 8. Research Search Space
+
+To eliminate or drastically reduce the computational burden of Smina docking against multiple protein conformations, the future research strategy comprises several distinct exploration buckets:
+
+### 8.1 Reduce Docking Frequency
+Rather than abandoning docking entirely, the inference funnel could be aggressively optimized. By deploying lightning-fast, highly-calibrated 2D classifiers (like the current XGBoost screening model or an ensemble of neural networks) to act as a strict gated filter, the system could confidently discard the bottom 99% of the library. Heavy, 6-conformation Smina docking would then only be triggered for the top 1% elite tier, collapsing compute time geometrically.
+
+### 8.2 Predict Docking-Derived Features
+Over the course of this project, roughly ~200,000 compounds have been physically docked against the RecA pockets. This historical repository contains invaluable labels for `score_mean`, `Dist_to_Walker_A`, and `HBond_Counts`. A deep Graph Neural Network (GNN) could be trained directly on this massive dataset to map 2D SMILES graphs to 3D docking features. In production, this GNN would instantly predict these physical features, entirely bypassing actual Smina execution while feeding the precise surrogate signals into the Delta Model.
+
+### 8.3 Distill Docking-Aware Teacher
+A classic Teacher-Student Knowledge Distillation architecture could bridge the gap between heavy physics and fast AI. A massive "Teacher" Regressor is trained using ground-truth docking features, achieving pristine performance. Simultaneously, a "Student" network is trained using only 2D features (ECFP/Descriptors) but optimized not just on the `pIC50` label, but via KL-Divergence to mimic the exact latent representations and logits of the Teacher model. The student absorbs the physics "intuition" without actually computing the physics.
+
+### 8.4 Pocket-Aware Docking-Free Models
+Leverage foundation models designed explicitly for zero-shot molecular binding (e.g., CLIP-based twin-tower encoders, EquiBind, or DiffDock-like variants). These models fuse a structural embedding of the bare protein pocket (the 1REA/8AMD rigid structures) with the molecular graph embedding, learning a continuous contrastive space where Euclidean distance mathematically correlates to binding affinity, omitting discrete rigid sampling completely.
+
+### 8.5 Low-Data ML Improvements
+The foundational limit of this project is the `N=49` active compound dataset constraint. Scaling prediction architectures requires aggressive low-data adaptations: implementing Model-Agnostic Meta-Learning (MAML) for few-shot adaptation, leveraging massive unsupervised pretraining on unlabeled chemical space (e.g., masked graph modeling), or introducing biologically-sound data augmentation via 3D conformer jittering.
+
+### 8.6 Retrieval and Calibration Ideas
+Regression networks often hallucinate wildly out-of-distribution (OOD). A k-Nearest Neighbors (k-NN) retrieval layer can search a massive, pre-computed latent database of known interactions to enforce boundary calibration. If a test compound strays too deeply into uncharted latent space, the retrieval layer forces conservative variance scaling (like the Gaussian Process bounds), restricting catastrophic "Perfect Bind" hallucinations.
+
+
+## 9. Non-Negotiable Project Constraints
+
+When architecting next-generation solutions across the Search Space, the following non-negotiable boundaries rigidly govern algorithmic design parameters:
+
+- **Low-Data Regime (`N=49`):** Architectures requiring millions of labels to train embeddings from scratch are fundamentally invalid for the potency regressor. Transfer learning, zero-shot adaptation, and heavily regularized GP/Linear layers are mandatory.
+- **Scaffold-Split Only Evaluation:** Standard 80/20 randomized train/test splits are strictly forbidden. System metrics must exclusively rely upon Murcko Scaffold clustering (or Tanimoto `< 0.4` divergence) to mathematically enforce out-of-distribution extrapolative evaluation.
+- **Must Preserve OOD Performance:** The explicitly stated goal of this pipeline is scanning for entirely novel binders. A model that achieves `0.05` RMSE on train but fails on Tanimoto Extrapolation isolates itself into useless interpolation. OOD RMSE must remain heavily optimized (under `0.30`).
+- **Docking Currently Contributes Real Signal:** As demonstrated by the drastic reduction in errors during iterations 6 & 7, exact structural features (`Dist_to_Walker_A`, `HBond_Counts`) align with ground-truth biology. Any 2D surrogate or zero-shot feature encoder must mathematically prove it encapsulates these specific interactions, not just statistical correlations.
+- **Avoid Benchmark Leakage:** The precise bisection of physics training (conducted statically over the entire active dataset) vs chemical residuals (conducted strictly under Cross-Validation) must not be corrupted by future architectures. Precomputation steps must aggressively isolate the validation scaffolds to guarantee pure blind-test integrity.
+- **Acceptable Speed/Accuracy Tradeoff:** Current multi-conformation Smina operations consume ~10-60 minutes per molecule on standard CPUs. A zero-docking approach must drop this to milliseconds. A degradation in Extrapolation RMSE is permissible, but strictly within a predefined ~15% tolerance of the Smina gold standard.
+
+
+## 10. Appendices
+
+### A. Hyperparameters - XGBoost Classifier
+```python
+XGBClassifier(
+    n_estimators=200, 
+    max_depth=6, 
+    learning_rate=0.1,
+    scale_pos_weight=5, 
+    eval_metric='logloss'
+)
+```
+
+### B. Tanimoto Kernel Mathematical Definition
+To calculate chemical similarity purely over bit vectors, a custom Tanimoto Kernel was bound into Scikit-Learn's Gaussian Process:
+```python
+class TanimotoKernel(Kernel):
+    def __call__(self, X, Y=None, eval_gradient=False):
+        X = np.atleast_2d(X); Y = np.atleast_2d(Y) if Y is not None else X
+        dot_prod = np.dot(X, Y.T)
+        x_sum = np.sum(X, axis=1); y_sum = np.sum(Y, axis=1)
+        denom = x_sum[:, None] + y_sum[None, :] - dot_prod
+        denom[denom == 0] = 1.0
+        K = self.variance * (dot_prod / denom)
+        return (K, K[:, :, np.newaxis]) if eval_gradient else K
+```
+
+### C. Complete Residue Mappings for Extracted Features
+These configurations dictates precisely how the codebase maps ligand atoms back to protein functionalities across all measured conformations:
+```python
+RESIDUE_MAPPING: Dict[str, Dict[str, List[int]]] = {
+    '1REA': {
+        'Walker_A': [66, 67, 68, 69, 70, 71, 72],
+        'Walker_A_Key': [71],           # Lys71
+        'Catalytic': [96],              # Glu96
+        'Adenine_Pocket': [103, 116, 117],  # Tyr103, Asn116, Ser117
+        'Walker_B': [144],              # Asp144
+        'Inter_Protomer': [23, 25, 28], # Lys23, Lys25, Arg28
+    },
+    '7JY7': {
+        'Walker_A': [66, 67, 68, 69, 70, 71, 72],
+        'Walker_A_Key': [71],
+        'Catalytic': [96],
+        'Walker_B': [144],
+        'Adenine_Pocket': [103],
+        'L2_Loop': [194, 196, 199, 203, 209, 212],
+        'L2_Key': [203, 212],           # Phe203, Val212
+    },
+    '8AMD': {
+        'Walker_A': [80, 81, 82, 83, 84, 85, 86, 87],
+        'Walker_A_Key': [85],
+        'Catalytic': [109],
+        'Walker_B': [113],
+        'Adenine_Pocket': [116],
+        'Inter_Protomer': [264, 265, 266, 267, 268, 269, 270, 271, 272,
+                           230, 231, 232],
+    },
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### D. End of Specification Document
+This document provides complete operational, architectural, and data context for the RecA structural optimization research pipeline. Use this material heavily when defining zero-docking scaling initiatives.
+

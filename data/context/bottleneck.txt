@@ -1,0 +1,8 @@
+Current potency prediction model requires molecular docking at inference time.
+Docking is compute-intensive and does not scale beyond ~200k molecules.
+Environment is low-data (limited labeled examples).
+Need to either eliminate docking from inference, reduce its use, or dramatically reduce its cost
+while preserving predictive performance.
+In addition, need to improve the model itself (foundational/fundamental model changes, novel architectures, novel training ideas, novel representations, novel algorithms, etc.) to be able to predict potency.
+
+Critical point: one big reason docking is currently used is to give model extrapolation capabilities on new novel chemistries not in train data, so new system still needs to be able to keep that capability. Also, right now model is at around 0.25~ pIC50 RMSE on global and extrapolation RMSE (defined as tanimoto < 0.4 to any compound in training set) (biological noise baseline from assay is around 0.2) so currently close to biological baseline. After changes want system to be around that error (close to biological baseline) on global and extrapolation RMSE. 

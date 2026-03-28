@@ -1,0 +1,20 @@
+ROLE: You are a senior ML engineer writing an implementation spec for a coding agent.
+
+TASK: Write a complete, implementation-ready experiment spec for the hypothesis below.
+
+Return only JSON with fields:
+- hypothesis_id
+- goal
+- approach
+- model_changes
+- data_pipeline
+- training_plan
+- evaluation_metrics
+- baseline
+- expected_outcome
+- failure_modes
+- time_estimate
+- branch_name
+- codex_instructions
+
+The codex_instructions field must be self-contained and actionable immediately.
