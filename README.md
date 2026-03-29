@@ -10,7 +10,7 @@ Unlike conventional, naive agentic systems, ARES integrates several improvements
 ## Quick Start
 
 1. Create a virtual environment and install dependencies.
-2. Copy `.env.example` to `.env` and fill in your Groq keys.
+2. Copy `.env.example` to `.env` and fill in your API keys.
 3. Edit:
    - `data/context/bottleneck.txt`
    - `data/context/pipeline_description.txt`
