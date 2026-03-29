@@ -3,7 +3,9 @@
 
 # ARES
 
-Automated Research Engine for Specification.
+Project ARES: Automated Research Engine for Specification is a structured research acceleration system designed to turn high-level pipeline descriptions, identified bottlenecks, and relevant scientific literature into high-quality, attackable research hypotheses and concrete experiment specifications. Engineered as a solution for low-data, high-compute machine learning environments, ARES utilizes a distinct "Core Loop" architecture that orchestrates multiple, specialized LLM agents in parallel and sequential stages. The system ingests context, retrieves and synthesizes literature, generates hypotheses through both grounded and "free-range" passes, red-teams and ranks the outputs, and ultimately produces implementation-ready specifications.
+
+Unlike conventional, naive agentic systems, ARES integrates several improvements to enhance research quality and efficiency. A core feature is Failure Memory, where every killed idea is stored in a "graveyard" with its kill reason and versioned context, then fed back into subsequent generation cycles to prevent the redundant exploration of failed concepts. The engine also features Consensus Flagging, which automatically prioritizes high-confidence directions that independently emerge across multiple distinct LLM passes. Furthermore, by enforcing a deterministic Python orchestration layer with rigorous data schemas and automated token rotation, ARES ensures traceability, reproducibility, and structured output suitable for immediate parallel execution by Codex agents.
 
 ## Quick Start
 
