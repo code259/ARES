@@ -16,3 +16,5 @@ Your task:
    - Minimal experiment to validate
 
 Format: numbered list, one hypothesis per item. Be specific and technical.
+
+Output format: .txt file

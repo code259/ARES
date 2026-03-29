@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -9,10 +10,16 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, TypeVar
 
+try:
+    from google import genai
+    from google.genai import types as genai_types
+except ImportError:  # pragma: no cover - exercised in environments without google-genai installed
+    genai = None
+    genai_types = None
 from openai import APIConnectionError, AsyncOpenAI, RateLimitError
 from pydantic import BaseModel
 
-from core.config import CACHE_DIR, MODEL_LIMITS, RATE_STATE_PATH, TOKEN_LOG, groq_keys, require_any_api_key, role_endpoint
+from core.config import CACHE_DIR, MODEL_LIMITS, RATE_STATE_PATH, SAFE_PROMPT_TOKENS, TOKEN_LOG, groq_keys, require_any_api_key, role_endpoint, role_fallback_endpoints
 
 
 T = TypeVar("T", bound=BaseModel)
@@ -27,7 +34,15 @@ class DailyBudgetExhausted(RuntimeError):
 
 
 class OversizeRequestError(RuntimeError):
-    pass
+    def __init__(self, *, role: str, model: str, estimated_tokens: int, limit_tokens: int):
+        super().__init__(
+            f"Estimated request size {estimated_tokens} tokens exceeds safe limit "
+            f"{limit_tokens} for {model}.",
+        )
+        self.role = role
+        self.model = model
+        self.estimated_tokens = estimated_tokens
+        self.limit_tokens = limit_tokens
 
 
 def _extract_json_block(text: str) -> str:
@@ -103,7 +118,7 @@ class LLMRegistry:
         today = self._today_key()
         days = self._rate_state.setdefault("days", {})
         day_state = days.setdefault(today, {})
-        key_state = day_state.setdefault(key[-6:], {})
+        key_state = day_state.setdefault(key, {})
         model_state = key_state.setdefault(
             model,
             {
@@ -185,7 +200,7 @@ class LLMRegistry:
         if rpm is not None and state["requests_minute"] + 1 > rpm:
             wait_seconds = max(wait_seconds, 61 - (time.time() % 60))
 
-        backoff_until = self._rate_state.setdefault("temporary_backoff", {}).get(f"{key[-6:]}::{model}", 0)
+        backoff_until = self._rate_state.setdefault("temporary_backoff", {}).get(f"{key}::{model}", 0)
         if backoff_until > time.time():
             wait_seconds = max(wait_seconds, backoff_until - time.time())
         return wait_seconds
@@ -194,7 +209,7 @@ class LLMRegistry:
         if not self._groq_keys:
             raise RuntimeError("No Groq keys are configured.")
 
-        waits = [(key, self._candidate_wait_seconds(key, model, estimated_tokens)) for key in self._groq_keys]
+        waits = [(f"groq:{key[-6:]}", self._candidate_wait_seconds(f"groq:{key[-6:]}", model, estimated_tokens)) for key in self._groq_keys]
         immediate = [item for item in waits if item[1] == 0]
         if immediate:
             key = immediate[self._groq_index % len(immediate)][0]
@@ -231,6 +246,62 @@ class LLMRegistry:
     def _client(api_key: str, base_url: str | None) -> AsyncOpenAI:
         return AsyncOpenAI(api_key=api_key, base_url=base_url)
 
+    @staticmethod
+    def _gemini_client(api_key: str):
+        if genai is None:
+            raise RuntimeError(
+                "Gemini support requires `google-genai`. Install project dependencies again to enable Gemini routing.",
+            )
+        return genai.Client(api_key=api_key)
+
+    @staticmethod
+    def _close_open_objects(schema: Any) -> Any:
+        if isinstance(schema, dict):
+            schema_type = schema.get("type")
+            if schema_type == "object":
+                schema.setdefault("additionalProperties", False)
+                properties = schema.get("properties")
+                if isinstance(properties, dict):
+                    schema["required"] = list(properties.keys())
+            for key, value in list(schema.items()):
+                schema[key] = LLMRegistry._close_open_objects(value)
+            return schema
+        if isinstance(schema, list):
+            return [LLMRegistry._close_open_objects(item) for item in schema]
+        return schema
+
+    @staticmethod
+    def _response_format(model: str, response_model: type[T]) -> dict[str, Any]:
+        schema = LLMRegistry._close_open_objects(response_model.model_json_schema())
+        if model in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_model.__name__.lower(),
+                    "strict": True,
+                    "schema": schema,
+                },
+            }
+        if model in {"moonshotai/kimi-k2-instruct", "moonshotai/kimi-k2-instruct-0905"}:
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_model.__name__.lower(),
+                    "strict": False,
+                    "schema": schema,
+                },
+            }
+        return {"type": "json_object"}
+
+    @staticmethod
+    def _gemini_schema_instruction(response_model: type[T]) -> str:
+        schema = LLMRegistry._close_open_objects(response_model.model_json_schema())
+        return (
+            "Return only valid JSON matching this schema. "
+            "Do not wrap it in markdown fences.\n"
+            f"JSON_SCHEMA:\n{json.dumps(schema, separators=(',', ':'))}"
+        )
+
     def _log_usage(
         self,
         role: str,
@@ -246,7 +317,7 @@ class LLMRegistry:
 
         if provider == "groq":
             for key in self._groq_keys:
-                if key.endswith(key_suffix):
+                if key.endswith(key_suffix.replace("groq:", "")):
                     self._groq_usage[key] += total_tokens
                     running_total = self._groq_usage[key]
                     break
@@ -270,6 +341,49 @@ class LLMRegistry:
         with TOKEN_LOG.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry) + "\n")
 
+    async def _gemini_generate(
+        self,
+        *,
+        endpoint,
+        system_prompt: str,
+        user_prompt: str,
+        response_model: type[T],
+        temperature: float,
+    ) -> str:
+        if genai_types is None:
+            raise RuntimeError(
+                "Gemini support requires `google-genai`. Install project dependencies again to enable Gemini routing.",
+            )
+        config = genai_types.GenerateContentConfig(
+            temperature=temperature,
+            response_mime_type="application/json",
+            system_instruction=f"{system_prompt}\n\n{self._gemini_schema_instruction(response_model)}",
+        )
+        client = self._gemini_client(endpoint.api_key or "")
+        contents = [
+            genai_types.Content(
+                role="user",
+                parts=[genai_types.Part.from_text(text=user_prompt)],
+            ),
+        ]
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=endpoint.model,
+            contents=contents,
+            config=config,
+        )
+        text = getattr(response, "text", None)
+        if text:
+            return text
+        parts: list[str] = []
+        for candidate in getattr(response, "candidates", []) or []:
+            content = getattr(candidate, "content", None)
+            for part in getattr(content, "parts", []) or []:
+                part_text = getattr(part, "text", None)
+                if part_text:
+                    parts.append(part_text)
+        return "".join(parts)
+
     async def complete_structured(
         self,
         *,
@@ -285,12 +399,14 @@ class LLMRegistry:
         self._groq_keys = groq_keys()
         for key in self._groq_keys:
             self._groq_usage.setdefault(key, 0)
-        endpoint = role_endpoint(role)
+        endpoints = role_fallback_endpoints(role)
+        if not endpoints:
+            raise RuntimeError(f"No endpoint configured for role '{role}'.")
+        primary = endpoints[0]
         last_error: Exception | None = None
-        limits = MODEL_LIMITS.get(endpoint.model, {})
         cache_path = self._cache_path(
             role=role,
-            model=endpoint.model,
+            model=" -> ".join(f"{endpoint.provider}:{endpoint.model}" for endpoint in endpoints),
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=temperature,
@@ -300,76 +416,139 @@ class LLMRegistry:
         if cached is not None:
             self._log_usage(
                 role=role,
-                provider=endpoint.provider,
-                model=endpoint.model,
+                provider=primary.provider,
+                model=primary.model,
                 key_suffix="cache",
                 usage=type("Usage", (), {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})(),
                 cache_hit=True,
             )
             return cached
 
-        for _attempt in range(retries):
-            api_key = endpoint.api_key
-            base_url = endpoint.base_url
+        for endpoint in endpoints:
+            limits = MODEL_LIMITS.get(endpoint.model, {})
+            for attempt in range(retries):
+                api_key = endpoint.api_key
+                base_url = endpoint.base_url
+                usage_key = None
 
-            if endpoint.provider == "groq":
                 estimated_tokens = self._approx_tokens(system_prompt, user_prompt, max_tokens=max_tokens)
-                tpm_limit = limits.get("tpm")
-                if tpm_limit is not None and estimated_tokens > tpm_limit:
-                    raise OversizeRequestError(
-                        f"Estimated request size {estimated_tokens} tokens exceeds per-minute model limit "
-                        f"{tpm_limit} for {endpoint.model}. Shrink the payload before retrying.",
+                safe_limit = SAFE_PROMPT_TOKENS.get(endpoint.model) or limits.get("tpm")
+                if safe_limit is not None and estimated_tokens > safe_limit:
+                    if endpoint is endpoints[-1]:
+                        raise OversizeRequestError(
+                            role=role,
+                            model=endpoint.model,
+                            estimated_tokens=estimated_tokens,
+                            limit_tokens=int(safe_limit),
+                        )
+                    last_error = OversizeRequestError(
+                        role=role,
+                        model=endpoint.model,
+                        estimated_tokens=estimated_tokens,
+                        limit_tokens=int(safe_limit),
                     )
-                api_key, wait_seconds = self._reserve_key_for_model(endpoint.model, estimated_tokens)
-                if wait_seconds > 0:
-                    time.sleep(wait_seconds)
+                    break
 
-            if not api_key:
-                raise RuntimeError(f"No API key configured for role '{role}'.")
-
-            client = self._client(api_key=api_key, base_url=base_url)
-
-            try:
-                response = await client.chat.completions.create(
-                    model=endpoint.model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                )
-                message = response.choices[0].message.content or ""
-                payload = _extract_json_block(message)
-                parsed = response_model.model_validate_json(payload)
-                self._write_cache(cache_path, parsed)
                 if endpoint.provider == "groq":
+                    usage_key, wait_seconds = self._reserve_key_for_model(endpoint.model, estimated_tokens)
+                    if wait_seconds > 0:
+                        await asyncio.sleep(wait_seconds)
+                    resolved_key = next((key for key in self._groq_keys if usage_key and key.endswith(usage_key.replace("groq:", ""))), None)
+                    api_key = resolved_key
+                elif endpoint.provider == "gemini":
+                    usage_key = "gemini:default"
+                    wait_seconds = self._candidate_wait_seconds(usage_key, endpoint.model, estimated_tokens)
+                    if wait_seconds == float("inf"):
+                        last_error = DailyBudgetExhausted(
+                            f"Gemini budget exhausted for model {endpoint.model} today.",
+                        )
+                        break
+                    if wait_seconds > 0:
+                        await asyncio.sleep(wait_seconds)
+
+                if not api_key:
+                    last_error = RuntimeError(f"No API key configured for role '{role}' on provider '{endpoint.provider}'.")
+                    break
+
+                try:
+                    if endpoint.provider == "gemini":
+                        message = await self._gemini_generate(
+                            endpoint=endpoint,
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
+                            response_model=response_model,
+                            temperature=temperature,
+                        )
+                        payload = _extract_json_block(message)
+                        parsed = response_model.model_validate_json(payload)
+                        self._write_cache(cache_path, parsed)
+                        self._apply_usage(
+                            key=usage_key or "gemini:default",
+                            model=endpoint.model,
+                            prompt_tokens=estimated_tokens - max_tokens,
+                            completion_tokens=max_tokens,
+                        )
+                        self._log_usage(
+                            role=role,
+                            provider=endpoint.provider,
+                            model=endpoint.model,
+                            key_suffix=usage_key or "gemini:default",
+                            usage=type(
+                                "Usage",
+                                (),
+                                {
+                                    "prompt_tokens": max(0, estimated_tokens - max_tokens),
+                                    "completion_tokens": max_tokens,
+                                    "total_tokens": estimated_tokens,
+                                },
+                            )(),
+                        )
+                        return parsed
+
+                    client = self._client(api_key=api_key, base_url=base_url)
+                    response = await client.chat.completions.create(
+                        model=endpoint.model,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        response_format=self._response_format(endpoint.model, response_model),
+                    )
+                    message = response.choices[0].message.content or ""
+                    payload = _extract_json_block(message)
+                    parsed = response_model.model_validate_json(payload)
+                    self._write_cache(cache_path, parsed)
                     self._apply_usage(
-                        key=api_key,
+                        key=usage_key or f"groq:{api_key[-6:]}",
                         model=endpoint.model,
                         prompt_tokens=getattr(response.usage, "prompt_tokens", 0) or 0,
                         completion_tokens=getattr(response.usage, "completion_tokens", 0) or 0,
                     )
-                self._log_usage(
-                    role=role,
-                    provider=endpoint.provider,
-                    model=endpoint.model,
-                    key_suffix=api_key[-6:],
-                    usage=response.usage,
-                )
-                return parsed
-            except RateLimitError as exc:
-                last_error = exc
-                backoff = self._rate_state.setdefault("temporary_backoff", {})
-                backoff[f"{api_key[-6:]}::{endpoint.model}"] = time.time() + 65
-                self._save_rate_state()
-                continue
-            except APIConnectionError as exc:
-                last_error = exc
-                continue
-            except Exception as exc:
-                last_error = exc
-                continue
+                    self._log_usage(
+                        role=role,
+                        provider=endpoint.provider,
+                        model=endpoint.model,
+                        key_suffix=usage_key or f"groq:{api_key[-6:]}",
+                        usage=response.usage,
+                    )
+                    return parsed
+                except RateLimitError as exc:
+                    last_error = exc
+                    backoff = self._rate_state.setdefault("temporary_backoff", {})
+                    if usage_key:
+                        backoff[f"{usage_key}::{endpoint.model}"] = time.time() + 65
+                    self._save_rate_state()
+                    continue
+                except APIConnectionError as exc:
+                    last_error = exc
+                    continue
+                except Exception as exc:
+                    last_error = exc
+                    if endpoint.provider == "gemini" and attempt + 1 < retries:
+                        continue
+                    break
 
         raise RuntimeError(f"Failed structured completion for role '{role}': {last_error}")
 

@@ -1,0 +1,18 @@
+Using the context already loaded in this conversation, brainstorm a wide but grounded candidate set.
+
+Your task in this step:
+- Generate 12-18 candidate research directions
+- Stay grounded in the literature digest and the actual bottleneck
+- Prefer combinations, abstractions, and transfers that are plausible but not already obvious
+- Avoid duplicating ideas already in the hypothesis inventory or graveyard
+
+For each candidate direction, include:
+- Short name
+- 1-2 sentence core mechanism
+- Which method families or papers it draws from
+- Why it might help remove or reduce docking at inference
+- Biggest uncertainty
+
+Do not optimize for polish yet.
+Do not output the final importer-ready hypothesis set yet.
+This step is for breadth, pressure-testing, and surfacing the best options.

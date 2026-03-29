@@ -16,3 +16,6 @@ data/consensus/
 data/ranks/
 data/manual_inputs/
 data/manual_papers_extracted/
+data/manual_papers_failed/
+data/state/
+data/manifests/

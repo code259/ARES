@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Any
 
 import ulid
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 def new_hypothesis_id() -> str:
@@ -66,6 +67,15 @@ class PaperRecord(BaseModel):
     citations: list[str] = Field(default_factory=list)
 
 
+class EvidenceRecord(BaseModel):
+    title: str
+    method_family: str
+    core_idea: str
+    relevance_to_project: str
+    possible_transfer: str
+    failure_modes: str
+
+
 class Hypothesis(BaseModel):
     id: str = Field(default_factory=new_hypothesis_id)
     name: str
@@ -85,6 +95,79 @@ class Hypothesis(BaseModel):
     paper_refs: list[str] = Field(default_factory=list)
 
 
+class ImportedHypothesis(BaseModel):
+    name: str = ""
+    hypothesis: str = ""
+    method_family: str = ""
+    how_it_replaces_or_reduces_docking: str = ""
+    why_it_should_work_here: str = ""
+    data_requirements: str = ""
+    expected_speedup: str = ""
+    risk_level: RiskLevel = RiskLevel.MEDIUM
+    novelty: NoveltyLevel = NoveltyLevel.MODERATE
+    minimal_prototype: str = ""
+    killer_experiment: str = ""
+    kill_criteria: str = ""
+    paper_refs: list[str] = Field(default_factory=list)
+
+    @field_validator("risk_level", mode="before")
+    @classmethod
+    def normalize_risk_level(cls, value):
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+    @field_validator("novelty", mode="before")
+    @classmethod
+    def normalize_novelty(cls, value):
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            synonyms = {
+                "medium": "moderate",
+                "mid": "moderate",
+            }
+            return synonyms.get(normalized, normalized)
+        return value
+
+
+class PartialHypothesis(BaseModel):
+    id: str = Field(default_factory=new_hypothesis_id)
+    name: str = ""
+    hypothesis: str = ""
+    source: str = ""
+    brief_version: str = ""
+    method_family: str = ""
+    how_it_replaces_or_reduces_docking: str = ""
+    why_it_should_work_here: str = ""
+    data_requirements: str = ""
+    expected_speedup: str = ""
+    risk_level: RiskLevel = RiskLevel.MEDIUM
+    novelty: NoveltyLevel = NoveltyLevel.MODERATE
+    minimal_prototype: str = ""
+    killer_experiment: str = ""
+    kill_criteria: str = ""
+    paper_refs: list[str] = Field(default_factory=list)
+
+    @field_validator("risk_level", mode="before")
+    @classmethod
+    def normalize_partial_risk_level(cls, value):
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+    @field_validator("novelty", mode="before")
+    @classmethod
+    def normalize_partial_novelty(cls, value):
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            synonyms = {
+                "medium": "moderate",
+                "mid": "moderate",
+            }
+            return synonyms.get(normalized, normalized)
+        return value
+
+
 class KilledIdea(BaseModel):
     id: str
     name: str
@@ -101,6 +184,7 @@ class KilledIdea(BaseModel):
 
 class Review(BaseModel):
     hypothesis_id: str
+    brief_version: str = ""
     fatal_flaws: list[str] = Field(default_factory=list)
     hidden_assumptions: list[str] = Field(default_factory=list)
     data_mismatch: list[str] = Field(default_factory=list)
@@ -124,6 +208,7 @@ class RankRecord(BaseModel):
 
 class ExperimentSpec(BaseModel):
     hypothesis_id: str
+    brief_version: str = ""
     goal: str
     approach: str
     model_changes: str
@@ -136,6 +221,20 @@ class ExperimentSpec(BaseModel):
     time_estimate: str
     branch_name: str
     codex_instructions: str
+
+
+class RunManifest(BaseModel):
+    brief_version: str
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    status: str = "initialized"
+    parent_brief_version: str = ""
+    bottleneck_hash: str = ""
+    pipeline_hash: str = ""
+    paper_ids: list[str] = Field(default_factory=list)
+    stages_completed: list[str] = Field(default_factory=list)
+    manual_sources_imported: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ConsensusCluster(BaseModel):
@@ -156,6 +255,14 @@ class HypothesisList(BaseModel):
     hypotheses: list[Hypothesis] = Field(default_factory=list)
 
 
+class ImportedHypothesisList(BaseModel):
+    hypotheses: list[ImportedHypothesis] = Field(default_factory=list)
+
+
+class PartialHypothesisList(BaseModel):
+    hypotheses: list[PartialHypothesis] = Field(default_factory=list)
+
+
 class ReviewList(BaseModel):
     reviews: list[Review] = Field(default_factory=list)
 
@@ -170,3 +277,23 @@ class SpecList(BaseModel):
 
 class ConsensusClusters(BaseModel):
     clusters: list[ConsensusCluster] = Field(default_factory=list)
+
+
+class ChunkManifest(BaseModel):
+    chunk_id: str
+    role: str
+    brief_version: str
+    model: str
+    estimated_tokens: int
+    item_count: int
+    payload_hash: str
+    metadata: dict[str, str] = Field(default_factory=dict)
+
+
+class StageState(BaseModel):
+    stage: str
+    brief_version: str
+    status: str = "in_progress"
+    completed_units: list[str] = Field(default_factory=list)
+    failed_units: list[str] = Field(default_factory=list)
+    metadata: dict[str, str] = Field(default_factory=dict)

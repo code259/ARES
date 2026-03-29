@@ -1,0 +1,31 @@
+Using the candidate directions you just generated and the loaded context, now produce the final grounded hypothesis set.
+
+Selection rules:
+- Choose the 6-8 strongest ideas only
+- Prioritize highest expected ROI, attackability, and novelty-adjusted plausibility
+- Do not include filler ideas
+- Avoid ideas that materially duplicate each other
+- Prefer ideas that exploit the literature better than a naive single-paper transfer
+
+Output format:
+- Numbered list
+- One hypothesis per item
+- Use the exact field labels below so the importer can parse them more reliably
+
+For each hypothesis include:
+Name:
+Core idea:
+Method family:
+How it reduces or replaces docking:
+Why it should work here:
+Data requirements:
+Expected speedup:
+Risk level:
+Novelty:
+Minimal prototype:
+Killer experiment:
+Kill criteria:
+Paper refs:
+
+Keep each field concise but specific.
+Return only the numbered hypothesis list.
